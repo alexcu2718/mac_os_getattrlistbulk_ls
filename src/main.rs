@@ -12,35 +12,18 @@ const VCHR: u8 = 4;
 const VFIFO: u8 = 6;
 const VSOCK: u8 = 7;
 
-#[test]
-fn show_weird_behaviour_of_macos(){
+mod test;
 
-
-    assert!(VREG!=libc::DT_REG);
-    assert!(VDIR!=libc::DT_DIR);
-    assert!(VBLK!=libc::DT_BLK);
-    assert!(VFIFO!=libc::DT_FIFO);
-    assert!(VSOCK!=libc::DT_SOCK);
-
-
-
-
-}
-
-// File entry information
+// File entry information (a beta version to match API in my own crate)
 #[derive(Debug, Clone)]
-struct FileEntry {
+struct DirEntryBeta {
     path: SlimmerBytes,
     file_type: FileType,
     //file_name_index: u16,
+    // depth:u8 
     inode: u64,
 }
 
-//artifact from some code i copy pasted.
-#[derive(Debug)]
-struct DirInfo {
-    entries: Vec<FileEntry>,
-}
 
 
 
@@ -69,13 +52,10 @@ fn main() {
 
     let root_dir = &args[1];
 
-    let result = list_files(root_dir.clone());
+    let result = get_dir_info(&root_dir);
 
     match result {
         Ok(entries) => {
-            // Print header
-       
-            
             for entry in entries {
                 let entry_formatted=String::from_utf8_lossy(&entry.path);
                 println!("{:<60} {:<15} {:<12}", 
@@ -92,17 +72,8 @@ fn main() {
     }
 }
 
-// Recursively list all files and their information
-fn list_files(root_dir: String) -> Result<Vec<FileEntry>, String> {
-    // Get directory contents
-    let dir_info = get_dir_info(&root_dir)?;
 
-   
-
-    Ok(dir_info.entries)
-}
-
-fn get_dir_info(path: &str) -> Result<DirInfo, String> {
+fn get_dir_info(path: &str) -> Result<Vec<DirEntryBeta>, String> {
     // Open directory
     let c_path:*const u8 = unsafe{cstr!(path)};
     const FLAGS: i32 = libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NONBLOCK;
@@ -133,7 +104,7 @@ fn get_dir_info(path: &str) -> Result<DirInfo, String> {
         forkattr: 0,
     };
 
-    let mut attrbuf = [0u8; 128 * 1024];
+    let mut attrbuf = [0u8; 128 * 1024]; //THIS BUFFER IS PROBABLY *WAY TOO BIG*, i need to read more about this to address it.
     let mut entries = Vec::new();
 
     loop {
@@ -175,6 +146,7 @@ fn get_dir_info(path: &str) -> Result<DirInfo, String> {
                 field_ptr = field_ptr.add(std::mem::size_of::<libc::attribute_set_t>());
 
                 // Extract filename
+                //this needs to be all erased and rewritten soon, sigh.
                 let mut filename: Option<String> = None;
                 if returned_attrs.commonattr & libc::ATTR_CMN_NAME != 0 {
                     let name_start = field_ptr; // Save start of attrreference_t
@@ -194,6 +166,7 @@ fn get_dir_info(path: &str) -> Result<DirInfo, String> {
                                 continue;
                             }
                             filename = Some(String::from_utf8_lossy(name_slice).to_string());
+                            //this is hacky too.
                         
                     }
                 }
@@ -229,7 +202,7 @@ fn get_dir_info(path: &str) -> Result<DirInfo, String> {
                 };
 
                 // Create entry for all file types
-                if let Some(name) = filename {
+                if let Some(name) = filename { //deleting this soon.
                     let full_path = if path == "/" {
                         format!("/{}", name)
                     } else {
@@ -238,10 +211,11 @@ fn get_dir_info(path: &str) -> Result<DirInfo, String> {
 
                     let file_type = get_filetype(obj_type);
 
-                    let entry = FileEntry {
-                        path: full_path.as_bytes().into(),
+                    let entry = DirEntryBeta {
+                        path: full_path.as_bytes().into(), //im slowly patching the API to meet my own, this is SO stupid.
                         file_type,
-                        //file_name_index:full_path.len()-
+                        //file_name_index TODO!
+                        //depth TODO!
                         inode,
                     };
 
@@ -261,5 +235,5 @@ fn get_dir_info(path: &str) -> Result<DirInfo, String> {
         libc::close(dirfd);
     }
 
-    Ok(DirInfo { entries })
+    Ok(entries )
 }
