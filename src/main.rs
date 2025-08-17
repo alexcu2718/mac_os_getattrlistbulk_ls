@@ -20,11 +20,12 @@ mod test;
 
 // File entry information (a beta version to match API in my own crate)
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct DirEntryBeta {
     path: SlimmerBytes,
     file_type: FileType,
     //file_name_index: u16,
-    // depth:u8 
+    depth:u8,
     inode: u64,
 }
 
@@ -245,7 +246,7 @@ where S:BytesStorage {
                         path: full_path.into(), //im slowly patching the API to meet my own, this is SO stupid.
                         file_type,
                         //file_name_index TODO!
-                        //depth TODO!
+                        depth:(s_path.depth()+1) as u8,
                         inode,
                     };
 
