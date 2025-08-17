@@ -86,26 +86,30 @@ fn main() {
 }
 
 unsafe fn join_slices(a: &[u8], b: &[u8]) -> Box<[u8]> {
-    let combined_len = a.len() + b.len();
+    let needs_slash = !a.ends_with(b"/");
+    let slash_len = if needs_slash { 1 } else { 0 };
+    let combined_len = a.len() + slash_len + b.len();
 
-    //let needs_slash = u8::from(a != b"/");
-    let mut buffer=AlignedBuffer::<u8,{libc::PATH_MAX as _}>::new();
-
+    let mut buffer = AlignedBuffer::<u8, {libc::PATH_MAX as _}>::new();
     let dest_ptr = buffer.as_mut_ptr() as *mut u8;
 
-    unsafe{std::ptr::copy_nonoverlapping(a.as_ptr(), dest_ptr, a.len())}
+    unsafe { std::ptr::copy_nonoverlapping(a.as_ptr(), dest_ptr, a.len()) }
 
+    if needs_slash {
+        unsafe { *dest_ptr.add(a.len()) = b'/' };
+    }
 
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            b.as_ptr(),
+            dest_ptr.add(a.len() + slash_len),
+            b.len(),
+        )
+    }
 
-
-    unsafe{std::ptr::copy_nonoverlapping(b.as_ptr(), dest_ptr.add(a.len()), b.len())}
-
-   
-    let initialised_slice = unsafe{&*std::ptr::slice_from_raw_parts(dest_ptr, combined_len)};
-
+    let initialised_slice = unsafe { &*std::ptr::slice_from_raw_parts(dest_ptr, combined_len) };
     initialised_slice.into()
 }
-
 
 fn get_dir_info<S>(s_path: &fdf::DirEntry<S>) -> Result<Vec<DirEntryBeta>, String>
 where S:BytesStorage {
