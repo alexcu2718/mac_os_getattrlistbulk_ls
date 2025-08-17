@@ -2,6 +2,8 @@ use std::env;
 use fdf::FileType;
 use fdf::cstr;
 pub type SlimmerBytes = Box<[u8]>;
+use fdf::AlignedBuffer;
+
 // macOS-specific constants not in libc crate
 const ATTR_CMN_ERROR: u32 = 0x20000000;
 const VREG: u8 = 1; //DT_REG !=THIS (weird convention)
@@ -50,9 +52,22 @@ fn main() {
         std::process::exit(1);
     }
 
-    let root_dir = &args[1];
+    let root_dir = args[1].as_bytes();
 
-    let result = get_dir_info(&root_dir);
+ 
+    
+
+
+
+    let new_direntry=DirEntryBeta{
+        path:root_dir.into(),
+        file_type:FileType::Directory,
+        inode:0
+    
+    
+    };
+
+    let result = get_dir_info(&new_direntry);
 
     match result {
         Ok(entries) => {
@@ -72,9 +87,27 @@ fn main() {
     }
 }
 
+unsafe fn join_slices(a: &[u8], b: &[u8]) -> Box<[u8]> {
+    let combined_len = a.len() + b.len();
 
-fn get_dir_info(path: &str) -> Result<Vec<DirEntryBeta>, String> {
-    // Open directory
+ 
+    let mut buffer=AlignedBuffer::<u8,{libc::PATH_MAX as _}>::new();
+
+    let dest_ptr = buffer.as_mut_ptr() as *mut u8;
+
+    unsafe{std::ptr::copy_nonoverlapping(a.as_ptr(), dest_ptr, a.len())}
+
+    unsafe{std::ptr::copy_nonoverlapping(b.as_ptr(), dest_ptr.add(a.len()), b.len())}
+
+   
+    let initialised_slice = unsafe{&*std::ptr::slice_from_raw_parts(dest_ptr, combined_len)};
+
+    initialised_slice.into()
+}
+
+
+fn get_dir_info(s_path: &DirEntryBeta) -> Result<Vec<DirEntryBeta>, String> {
+    let path=&s_path.path;
     let c_path:*const u8 = unsafe{cstr!(path)};
     const FLAGS: i32 = libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NONBLOCK;
     let dirfd = unsafe { libc::open(c_path.cast(), FLAGS) };
@@ -86,7 +119,7 @@ fn get_dir_info(path: &str) -> Result<Vec<DirEntryBeta>, String> {
             libc::ENOTDIR => "Not a directory",
             _ => "Cannot access directory",
         };
-        return Err(format!("{}: {}", path, error_msg));
+        return Err(format!("{error_msg}"));
     }
 
     // Set up attribute list for getattrlistbulk
@@ -126,7 +159,7 @@ fn get_dir_info(path: &str) -> Result<Vec<DirEntryBeta>, String> {
                     libc::ENOENT => "No such file or directory",
                     _ => "Cannot read directory contents",
                 };
-                return Err(format!("{}: {}", path, error_msg));
+                return Err(format!(": {}", error_msg));
             }
             break;
         }
@@ -147,7 +180,7 @@ fn get_dir_info(path: &str) -> Result<Vec<DirEntryBeta>, String> {
 
                 // Extract filename
                 //this needs to be all erased and rewritten soon, sigh.
-                let mut filename: Option<String> = None;
+                let mut filename: Option<&[u8]> = None;
                 if returned_attrs.commonattr & libc::ATTR_CMN_NAME != 0 {
                     let name_start = field_ptr; // Save start of attrreference_t
                     let name_info =
@@ -165,7 +198,7 @@ fn get_dir_info(path: &str) -> Result<Vec<DirEntryBeta>, String> {
                                 entry_ptr = entry_ptr.add(entry_length as usize);
                                 continue;
                             }
-                            filename = Some(String::from_utf8_lossy(name_slice).to_string());
+                            filename = Some(name_slice);
                             //this is hacky too.
                         
                     }
@@ -177,7 +210,8 @@ fn get_dir_info(path: &str) -> Result<Vec<DirEntryBeta>, String> {
                     field_ptr = field_ptr.add(std::mem::size_of::<u32>());
                     if error_code != 0 {
                         if let Some(name) = &filename {
-                            eprintln!("cannot access '{}/{}': error {}", path, name, error_code);
+                            let formatted_name=String::from_utf8_lossy(name);
+                            eprintln!("cannot access {formatted_name} error is   {}", error_code);
                         }
                         entry_ptr = entry_ptr.add(entry_length as usize);
                         continue;
@@ -203,16 +237,11 @@ fn get_dir_info(path: &str) -> Result<Vec<DirEntryBeta>, String> {
 
                 // Create entry for all file types
                 if let Some(name) = filename { //deleting this soon.
-                    let full_path = if path == "/" {
-                        format!("/{}", name)
-                    } else {
-                        format!("{}/{}", path, name)
-                    };
-
+                    let full_path =  join_slices(&path,name);
                     let file_type = get_filetype(obj_type);
 
                     let entry = DirEntryBeta {
-                        path: full_path.as_bytes().into(), //im slowly patching the API to meet my own, this is SO stupid.
+                        path: full_path.into(), //im slowly patching the API to meet my own, this is SO stupid.
                         file_type,
                         //file_name_index TODO!
                         //depth TODO!
