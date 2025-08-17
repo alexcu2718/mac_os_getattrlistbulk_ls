@@ -1,4 +1,6 @@
 use std::env;
+use fdf::BytePath;
+use fdf::BytesStorage;
 use fdf::FileType;
 use fdf::cstr;
 pub type SlimmerBytes = Box<[u8]>;
@@ -54,20 +56,15 @@ fn main() {
 
     let root_dir = args[1].as_bytes();
 
- 
+    let direntry=fdf::DirEntry::<SlimmerBytes>::new(root_dir.as_os_str()).unwrap();
+    //unwrapping here because im damn lazy
+
+   // let 
     
 
 
 
-    let new_direntry=DirEntryBeta{
-        path:root_dir.into(),
-        file_type:FileType::Directory,
-        inode:0
-    
-    
-    };
-
-    let result = get_dir_info(&new_direntry);
+    let result = get_dir_info(&direntry);
 
     match result {
         Ok(entries) => {
@@ -90,12 +87,15 @@ fn main() {
 unsafe fn join_slices(a: &[u8], b: &[u8]) -> Box<[u8]> {
     let combined_len = a.len() + b.len();
 
- 
+    //let needs_slash = u8::from(a != b"/");
     let mut buffer=AlignedBuffer::<u8,{libc::PATH_MAX as _}>::new();
 
     let dest_ptr = buffer.as_mut_ptr() as *mut u8;
 
     unsafe{std::ptr::copy_nonoverlapping(a.as_ptr(), dest_ptr, a.len())}
+
+
+
 
     unsafe{std::ptr::copy_nonoverlapping(b.as_ptr(), dest_ptr.add(a.len()), b.len())}
 
@@ -106,8 +106,9 @@ unsafe fn join_slices(a: &[u8], b: &[u8]) -> Box<[u8]> {
 }
 
 
-fn get_dir_info(s_path: &DirEntryBeta) -> Result<Vec<DirEntryBeta>, String> {
-    let path=&s_path.path;
+fn get_dir_info<S>(s_path: &fdf::DirEntry<S>) -> Result<Vec<DirEntryBeta>, String>
+where S:BytesStorage {
+    let path=s_path.as_bytes();
     let c_path:*const u8 = unsafe{cstr!(path)};
     const FLAGS: i32 = libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NONBLOCK;
     let dirfd = unsafe { libc::open(c_path.cast(), FLAGS) };
