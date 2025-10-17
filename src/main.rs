@@ -1,11 +1,8 @@
-use std::env;
-use fdf::BytePath;
-use fdf::BytesStorage;
+use std::{env, ffi::OsStr};
 use fdf::FileType;
-use fdf::cstr;
-pub type SlimmerBytes = Box<[u8]>;
-use fdf::AlignedBuffer;
-
+use core::ffi::CStr;
+use std::os::unix::ffi::OsStrExt;
+use core::cell::Cell;
 // macOS-specific constants not in libc crate
 const ATTR_CMN_ERROR: u32 = 0x20000000;
 const VREG: u8 = 1; //DT_REG !=THIS (weird convention)
@@ -22,15 +19,13 @@ mod test;
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct DirEntryBeta {
-    path: SlimmerBytes,
+    path: Box<CStr>,
     file_type: FileType,
-    //file_name_index: u16,
-    depth:u8,
+    file_name_index: usize,
+    depth: u16,
     inode: u64,
+    is_traversible_cache: Cell<Option<bool>>,
 }
-
-
-
 
 // hacky way to get filetype yay
 fn get_filetype(obj_type: u8) -> FileType {
@@ -41,11 +36,9 @@ fn get_filetype(obj_type: u8) -> FileType {
         VBLK => FileType::BlockDevice,
         VCHR => FileType::CharDevice,
         VFIFO | VSOCK => FileType::Socket,
-        
         _ => FileType::Unknown
     }
 }
-
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -55,26 +48,22 @@ fn main() {
         std::process::exit(1);
     }
 
-    let root_dir = args[1].as_bytes();
-
-    let direntry=fdf::DirEntry::<SlimmerBytes>::new(root_dir.as_os_str()).unwrap();
-    //unwrapping here because im damn lazy
-
-   // let 
-    
-
-
-
+    let root_dir: &OsStr = OsStrExt::from_bytes(args[1].as_bytes());
+    let direntry = fdf::DirEntry::new(root_dir).expect("i am not fixing this yet");
     let result = get_dir_info(&direntry);
 
     match result {
         Ok(entries) => {
             for entry in entries {
-                let entry_formatted=String::from_utf8_lossy(&entry.path);
-                println!("{:<60} {:<15} {:<12}", 
-                    entry_formatted, 
+                let entry_formatted = entry.path.to_bytes();
+                let file_name=String::from_utf8_lossy(&entry_formatted[entry.file_name_index..]);
+                let entry_string=String::from_utf8_lossy(entry_formatted);
+                println!("{:<60} {:<15} {:<12} {}", 
+                    entry_string, 
                     entry.file_type, 
                     entry.inode,
+                    file_name
+                 
                 );
             }
         }
@@ -85,47 +74,65 @@ fn main() {
     }
 }
 
-unsafe fn join_slices(a: &[u8], b: &[u8]) -> Box<[u8]> {
-    let needs_slash = !a.ends_with(b"/");
-    let slash_len = if needs_slash { 1 } else { 0 };
-    let combined_len = a.len() + slash_len + b.len();
+#[inline]
+fn init_from_direntry(dir_path: &fdf::DirEntry) -> (Vec<u8>, usize) {
+    let dir_path_in_bytes = dir_path.as_bytes();
+    let mut base_len = dir_path_in_bytes.len();
+    let is_root = dir_path_in_bytes == b"/";
+    let needs_slash: usize = usize::from(!is_root);
 
-    let mut buffer = AlignedBuffer::<u8, {libc::PATH_MAX as _}>::new();
-    let dest_ptr = buffer.as_mut_ptr() as *mut u8;
+    const MAX_SIZED_DIRENT_LENGTH: usize = 2 * 256; // 2* `NAME_MAX`
 
-    unsafe { std::ptr::copy_nonoverlapping(a.as_ptr(), dest_ptr, a.len()) }
+    let mut path_buffer = vec![0u8; base_len + needs_slash + MAX_SIZED_DIRENT_LENGTH];
+    let buffer_ptr = path_buffer.as_mut_ptr();
+    
+    unsafe { 
+        core::ptr::copy_nonoverlapping(dir_path_in_bytes.as_ptr(), buffer_ptr, base_len);
+         // SAFETY: write is within buffer bounds
+        *buffer_ptr.add(base_len) = b'/' * (!is_root as u8) // add slash if needed  (this avoids a branch ), either add 0 or  add a slash (multiplication)
+        
 
-    if needs_slash {
-        unsafe { *dest_ptr.add(a.len()) = b'/' };
-    }
+    };
 
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            b.as_ptr(),
-            dest_ptr.add(a.len() + slash_len),
-            b.len(),
-        )
-    }
-
-    let initialised_slice = unsafe { &*std::ptr::slice_from_raw_parts(dest_ptr, combined_len) };
-    initialised_slice.into()
+    base_len += needs_slash;
+    (path_buffer, base_len)
 }
 
-fn get_dir_info<S>(s_path: &fdf::DirEntry<S>) -> Result<Vec<DirEntryBeta>, String>
-where S:BytesStorage {
-    let path=s_path.as_bytes();
-    let c_path:*const u8 = unsafe{cstr!(path)};
+#[inline]
+fn append_filename_and_get_index<'a>(buffer: &'a mut [u8], base_len: usize, filename: &'a [u8]) -> (&'a CStr, usize) {
+    let filename_len = filename.len();
+    
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            filename.as_ptr(),
+            buffer.as_mut_ptr().add(base_len),
+            filename_len
+        );
+        // Null terminate
+        *buffer.as_mut_ptr().add(base_len + filename_len) = 0;
+        
+        let full_path = CStr::from_bytes_with_nul_unchecked(
+            &buffer[..base_len + filename_len + 1]
+        );
+        
+        (full_path, base_len)
+    }
+}
+
+fn get_dir_info(s_path: &fdf::DirEntry) -> Result<Vec<DirEntryBeta>, String> {
+    let c_path = s_path.as_ptr();
     const FLAGS: i32 = libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NONBLOCK;
     let dirfd = unsafe { libc::open(c_path.cast(), FLAGS) };
+    
     if dirfd == -1 {
         let errno = unsafe { *libc::__error() };
         let error_msg = match errno {
             libc::ENOENT => "No such file or directory",
-            libc::EACCES => "Permission denied",
+            libc::EACCES => "Permission denied", 
             libc::ENOTDIR => "Not a directory",
             _ => "Cannot access directory",
         };
-        return Err(format!("{error_msg}"));
+        return Err(error_msg.to_owned());
     }
 
     // Set up attribute list for getattrlistbulk
@@ -143,8 +150,11 @@ where S:BytesStorage {
         forkattr: 0,
     };
 
-    let mut attrbuf = [0u8; 128 * 1024]; //THIS BUFFER IS PROBABLY *WAY TOO BIG*, i need to read more about this to address it.
+    let mut attrbuf = [0u8; 128 * 1024];
     let mut entries = Vec::new();
+    
+    // initialise path buffer once per directory
+    let (mut path_buffer, base_len) = init_from_direntry(s_path);
 
     loop {
         let retcount = unsafe {
@@ -165,7 +175,7 @@ where S:BytesStorage {
                     libc::ENOENT => "No such file or directory",
                     _ => "Cannot read directory contents",
                 };
-                return Err(format!(": {}", error_msg));
+                return Err(error_msg.to_owned());
             }
             break;
         }
@@ -174,23 +184,18 @@ where S:BytesStorage {
         let mut entry_ptr = attrbuf.as_ptr();
         for _ in 0..retcount {
             unsafe {
-                 let entry_length = std::ptr::read(entry_ptr as *const u32);
+                let entry_length = std::ptr::read(entry_ptr as *const u32);
                 let mut field_ptr = entry_ptr.add(std::mem::size_of::<u32>());
 
                 // Read returned attributes bitmask
-                let returned_attrs =
-                  std::ptr::read(field_ptr as *const libc::attribute_set_t);
-
-
+                let returned_attrs = std::ptr::read(field_ptr as *const libc::attribute_set_t);
                 field_ptr = field_ptr.add(std::mem::size_of::<libc::attribute_set_t>());
 
                 // Extract filename
-                //this needs to be all erased and rewritten soon, sigh.
                 let mut filename: Option<&[u8]> = None;
                 if returned_attrs.commonattr & libc::ATTR_CMN_NAME != 0 {
-                    let name_start = field_ptr; // Save start of attrreference_t
-                    let name_info =
-                        std::ptr::read(field_ptr as *const libc::attrreference_t);
+                    let name_start = field_ptr;
+                    let name_info = std::ptr::read(field_ptr as *const libc::attrreference_t);
                     field_ptr = field_ptr.add(std::mem::size_of::<libc::attrreference_t>());
                     let name_ptr = name_start.add(name_info.attr_dataoffset as usize);
 
@@ -200,13 +205,11 @@ where S:BytesStorage {
                             (name_info.attr_length - 1) as usize,
                         );
                         
-                            if name_slice==b"." || name_slice==b".." {
-                                entry_ptr = entry_ptr.add(entry_length as usize);
-                                continue;
-                            }
-                            filename = Some(name_slice);
-                            //this is hacky too.
-                        
+                        if name_slice == b"." || name_slice == b".." {
+                            entry_ptr = entry_ptr.add(entry_length as usize);
+                            continue;
+                        }
+                        filename = Some(name_slice);
                     }
                 }
 
@@ -216,7 +219,7 @@ where S:BytesStorage {
                     field_ptr = field_ptr.add(std::mem::size_of::<u32>());
                     if error_code != 0 {
                         if let Some(name) = &filename {
-                            let formatted_name=String::from_utf8_lossy(name);
+                            let formatted_name = String::from_utf8_lossy(name);
                             eprintln!("cannot access {formatted_name} error is   {}", error_code);
                         }
                         entry_ptr = entry_ptr.add(entry_length as usize);
@@ -242,21 +245,20 @@ where S:BytesStorage {
                 };
 
                 // Create entry for all file types
-                if let Some(name) = filename { //deleting this soon.
-                    let full_path =  join_slices(&path,name);
+                if let Some(name) = filename {
+                    let (full_path, file_name_index) = append_filename_and_get_index(&mut path_buffer, base_len, name);
                     let file_type = get_filetype(obj_type);
 
                     let entry = DirEntryBeta {
-                        path: full_path.into(), //im slowly patching the API to meet my own, this is SO stupid.
+                        path: full_path.into(),
                         file_type,
-                        //file_name_index TODO!
-                        depth:(s_path.depth()+1) as u8,
+                        file_name_index,
+                        depth: (s_path.depth() + 1) as _,
                         inode,
+                        is_traversible_cache:Cell::new(None)
                     };
 
                     entries.push(entry);
-
-                  
                 }
 
                 // Move to next entry
@@ -270,5 +272,5 @@ where S:BytesStorage {
         libc::close(dirfd);
     }
 
-    Ok(entries )
+    Ok(entries)
 }
