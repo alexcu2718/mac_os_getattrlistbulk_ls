@@ -2,9 +2,11 @@
 name = "redir"
 version = "0.1.0"
 edition = "2024"
-
+rust-version = "1.87"
 
 [dependencies]
-fdf = "0.6.0"
+fdf = {git="https://github.com/alexcu2718/fdf"}
 libc = "0.2.175"
 
+[features]
+ssr = []

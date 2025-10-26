@@ -22,10 +22,11 @@ struct DirEntryBeta {
     path: Box<CStr>,
     file_type: FileType,
     file_name_index: usize,
-    depth: u16,
+    depth: u32,
     inode: u64,
     is_traversible_cache: Cell<Option<bool>>,
 }
+
 
 // hacky way to get filetype yay
 fn get_filetype(obj_type: u8) -> FileType {
@@ -108,31 +109,24 @@ fn append_filename_and_get_index<'a>(buffer: &'a mut [u8], base_len: usize, file
             buffer.as_mut_ptr().add(base_len),
             filename_len
         );
-        // Null terminate
         *buffer.as_mut_ptr().add(base_len + filename_len) = 0;
         
         let full_path = CStr::from_bytes_with_nul_unchecked(
-            &buffer[..base_len + filename_len + 1]
+            &buffer.get_unchecked(..base_len + filename_len + 1)
         );
         
         (full_path, base_len)
     }
 }
 
-fn get_dir_info(s_path: &fdf::DirEntry) -> Result<Vec<DirEntryBeta>, String> {
+fn get_dir_info(s_path: &fdf::DirEntry) -> Result<Vec<DirEntryBeta>, std::io::Error> {
     let c_path = s_path.as_ptr();
     const FLAGS: i32 = libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NONBLOCK;
     let dirfd = unsafe { libc::open(c_path.cast(), FLAGS) };
     
     if dirfd == -1 {
-        let errno = unsafe { *libc::__error() };
-        let error_msg = match errno {
-            libc::ENOENT => "No such file or directory",
-            libc::EACCES => "Permission denied", 
-            libc::ENOTDIR => "Not a directory",
-            _ => "Cannot access directory",
-        };
-        return Err(error_msg.to_owned());
+        return Err(std::io::Error::last_os_error());
+        
     }
 
     // Set up attribute list for getattrlistbulk
@@ -169,13 +163,7 @@ fn get_dir_info(s_path: &fdf::DirEntry) -> Result<Vec<DirEntryBeta>, String> {
 
         if retcount <= 0 {
             if retcount < 0 {
-                let errno = unsafe { *libc::__error() };
-                let error_msg = match errno {
-                    libc::EACCES => "Permission denied",
-                    libc::ENOENT => "No such file or directory",
-                    _ => "Cannot read directory contents",
-                };
-                return Err(error_msg.to_owned());
+                return Err(std::io::Error::last_os_error());
             }
             break;
         }
@@ -200,7 +188,7 @@ fn get_dir_info(s_path: &fdf::DirEntry) -> Result<Vec<DirEntryBeta>, String> {
                     let name_ptr = name_start.add(name_info.attr_dataoffset as usize);
 
                     if name_info.attr_length > 0 {
-                        let name_slice = &*std::ptr::slice_from_raw_parts(
+                        let name_slice = std::slice::from_raw_parts(
                             name_ptr,
                             (name_info.attr_length - 1) as usize,
                         );
@@ -218,9 +206,8 @@ fn get_dir_info(s_path: &fdf::DirEntry) -> Result<Vec<DirEntryBeta>, String> {
                     let error_code = std::ptr::read(field_ptr as *const u32);
                     field_ptr = field_ptr.add(std::mem::size_of::<u32>());
                     if error_code != 0 {
-                        if let Some(name) = &filename {
-                            let formatted_name = String::from_utf8_lossy(name);
-                            eprintln!("cannot access {formatted_name} error is   {}", error_code);
+                        if filename.is_some() {
+                             return Err(std::io::Error::last_os_error())
                         }
                         entry_ptr = entry_ptr.add(entry_length as usize);
                         continue;
