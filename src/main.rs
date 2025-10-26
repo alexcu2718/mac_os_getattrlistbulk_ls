@@ -2,6 +2,7 @@ use std::{env, ffi::OsStr};
 use fdf::FileType;
 use core::ffi::CStr;
 use std::os::unix::ffi::OsStrExt;
+use std::io;
 use core::cell::Cell;
 // macOS-specific constants not in libc crate
 const ATTR_CMN_ERROR: u32 = 0x20000000;
@@ -55,8 +56,8 @@ fn main() {
 
     match result {
         Ok(entries) => {
-            for nentry in entries {
-                if let Ok(entry)=nentry{
+            for entry in entries {
+                
                 let entry_formatted = entry.path.to_bytes();
                 let file_name=String::from_utf8_lossy(&entry_formatted[entry.file_name_index..]);
                 let entry_string=String::from_utf8_lossy(entry_formatted);
@@ -69,9 +70,9 @@ fn main() {
                 );
             }
             }
-        }
-        Err(e) => {
-            eprintln!("{}: {}", args[0], e);
+        
+        Err(_) => {
+            eprintln!("{}", args[0]);
             std::process::exit(1);
         }
     }
@@ -91,8 +92,7 @@ fn init_from_direntry(dir_path: &fdf::DirEntry) -> (Vec<u8>, usize) {
     
     unsafe { 
         core::ptr::copy_nonoverlapping(dir_path_in_bytes.as_ptr(), buffer_ptr, base_len);
-         // SAFETY: write is within buffer bounds
-        *buffer_ptr.add(base_len) = b'/' * (!is_root as u8) // add slash if needed  (this avoids a branch ), either add 0 or  add a slash (multiplication)
+        *buffer_ptr.add(base_len) = b'/' * (!is_root as u8) 
         
 
     };
@@ -120,8 +120,6 @@ fn append_filename_and_get_index<'a>(buffer: &'a mut [u8], base_len: usize, file
         (full_path, base_len)
     }
 }
-
-
 pub struct DirIterator {
     dirfd: i32,
     attrlist: libc::attrlist,
@@ -131,16 +129,17 @@ pub struct DirIterator {
     path_buffer: Vec<u8>,
     base_len: usize,
     depth: u32,
+    is_finished: bool,
 }
 
 impl DirIterator {
-    pub fn new(dir_path: &fdf::DirEntry) -> Result<Self, std::io::Error> {
+    pub fn new(dir_path: &fdf::DirEntry) -> Result<Self, io::Error> {
         let c_path = dir_path.as_ptr();
         const FLAGS: i32 = libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NONBLOCK;
         let dirfd = unsafe { libc::open(c_path.cast(), FLAGS) };
         
         if dirfd == -1 {
-            return Err(std::io::Error::last_os_error());
+            return Err(io::Error::last_os_error());
         }
 
         let attrlist = libc::attrlist {
@@ -170,30 +169,26 @@ impl DirIterator {
             path_buffer,
             base_len,
             depth,
+            is_finished: false,
         })
     }
 
-    fn read_next_batch(&mut self) -> Result<i32, std::io::Error> {
-        let retcount = unsafe {
-            libc::getattrlistbulk(
-                self.dirfd,
-                &mut self.attrlist as *mut libc::attrlist as *mut libc::c_void,
-                self.attrbuf.as_mut_ptr() as *mut libc::c_void,
-                self.attrbuf.len(),
-                0,
-            )
-        };
-
-        if retcount < 0 {
-            return Err(std::io::Error::last_os_error());
+    fn get_next_entry(&mut self) -> Option<DirEntryBeta> {
+        // If buffer is empty, read next batch
+        if self.remaining_entries <= 0 && !self.is_finished {
+            match self.read_next_batch() {
+                Ok(0) => {
+                    self.is_finished = true;
+                    return None;
+                }
+                Ok(_) => {} // We have new entries
+                Err(_) => {
+                    self.is_finished = true;
+                    return None;
+                }
+            }
         }
 
-        self.remaining_entries = retcount;
-        self.current_offset = 0;
-        Ok(retcount)
-    }
-
-    fn parse_next_entry(&mut self) -> Option<Result<DirEntryBeta, std::io::Error>> {
         if self.remaining_entries <= 0 {
             return None;
         }
@@ -201,9 +196,14 @@ impl DirIterator {
         unsafe {
             let entry_ptr = self.attrbuf.as_ptr().add(self.current_offset);
             let entry_length = std::ptr::read(entry_ptr as *const u32);
-            let mut field_ptr = entry_ptr.add(std::mem::size_of::<u32>());
+            
+            // Check bounds
+            if self.current_offset + entry_length as usize > self.attrbuf.len() {
+                self.remaining_entries = 0;
+                return None;
+            }
 
-            // Read returned attributes bitmask
+            let mut field_ptr = entry_ptr.add(std::mem::size_of::<u32>());
             let returned_attrs = std::ptr::read(field_ptr as *const libc::attribute_set_t);
             field_ptr = field_ptr.add(std::mem::size_of::<libc::attribute_set_t>());
 
@@ -216,32 +216,28 @@ impl DirIterator {
                 let name_ptr = name_start.add(name_info.attr_dataoffset as usize);
 
                 if name_info.attr_length > 0 {
-                    let name_slice = std::slice::from_raw_parts(
-                        name_ptr,
-                        (name_info.attr_length - 1) as usize,
-                    );
+                    let name_length = (name_info.attr_length - 1) as usize;
+                    let name_slice = std::slice::from_raw_parts(name_ptr, name_length);
                     
-                    if name_slice == b"." || name_slice == b".." {
-                        self.current_offset += entry_length as usize;
-                        self.remaining_entries -= 1;
-                        return self.parse_next_entry();
+                    // Skip . and ..
+                    if name_slice != b"." && name_slice != b".." {
+                        filename = Some(name_slice);
                     }
-                    filename = Some(name_slice);
                 }
             }
 
-            // Check for errors
-            if returned_attrs.commonattr & ATTR_CMN_ERROR != 0 {
-                let error_code = std::ptr::read(field_ptr as *const u32);
-                field_ptr = field_ptr.add(std::mem::size_of::<u32>());
-                if error_code != 0 {
-                    self.current_offset += entry_length as usize;
-                    self.remaining_entries -= 1;
-                    if filename.is_some() {
-                        return Some(Err(std::io::Error::from_raw_os_error(error_code as i32)));
-                    }
-                    return self.parse_next_entry();
-                }
+            // Skip entries without filenames or with errors
+            if filename.is_none() || (returned_attrs.commonattr & ATTR_CMN_ERROR != 0) {
+                if returned_attrs.commonattr & ATTR_CMN_ERROR != 0 {
+                    std::ptr::read(field_ptr as *const u32)
+                } else {
+                    0
+                };
+                
+                // Skip this entry
+                self.current_offset += entry_length as usize;
+                self.remaining_entries -= 1;
+                return self.get_next_entry();
             }
 
             // Get object type
@@ -264,42 +260,60 @@ impl DirIterator {
             self.current_offset += entry_length as usize;
             self.remaining_entries -= 1;
 
-            // Create entry
+       
             if let Some(name) = filename {
-                let (full_path, file_name_index) = append_filename_and_get_index(&mut self.path_buffer, self.base_len, name);
+                let (full_path, file_name_index) = append_filename_and_get_index(
+                    &mut self.path_buffer, 
+                    self.base_len, 
+                    name
+                );
                 let file_type = get_filetype(obj_type);
 
-                let entry = DirEntryBeta {
+                Some(DirEntryBeta {
                     path: full_path.into(),
                     file_type,
                     file_name_index,
                     depth: self.depth,
                     inode,
                     is_traversible_cache: Cell::new(None)
-                };
-
-                Some(Ok(entry))
+                })
             } else {
-                self.parse_next_entry()
+                self.get_next_entry()
             }
         }
+    }
+
+    fn read_next_batch(&mut self) -> Result<i32, io::Error> {
+        let retcount = unsafe {
+            libc::getattrlistbulk(
+                self.dirfd,
+                &mut self.attrlist as *mut libc::attrlist as *mut libc::c_void,
+                self.attrbuf.as_mut_ptr() as *mut libc::c_void,
+                self.attrbuf.len(),
+                0,
+            )
+        };
+
+        if retcount < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        if retcount == 0 {
+            self.is_finished = true;
+        }
+
+        self.remaining_entries = retcount;
+        self.current_offset = 0;
+        Ok(retcount)
     }
 }
 
 impl Iterator for DirIterator {
-    type Item = Result<DirEntryBeta, std::io::Error>;
+    type Item = DirEntryBeta;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        // If we have no more entries in the current buffer, read the next batch
-        if self.remaining_entries <= 0 {
-            match self.read_next_batch() {
-                Ok(0) => return None,
-                Ok(_) => {} 
-                Err(e) => return Some(Err(e)),
-            }
-        }
-
-        self.parse_next_entry()
+        self.get_next_entry()
     }
 }
 
@@ -310,5 +324,3 @@ impl Drop for DirIterator {
         }
     }
 }
-
-
